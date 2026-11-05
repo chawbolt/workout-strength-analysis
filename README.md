@@ -10,3 +10,6 @@ Exploratory data analysis and statistical modelling project in R examining how w
 # Findings
 - **Diminishing Returns:** Baseline strength 4 weeks prior is a significant predictor of 4 week strength change('p = 0.0002', 'Estimate = -0.196'), which shows how strength gains plateau as lifters reach their strength ceiling.
 - **Gym Durration:** Neither time in gym or total sessions ('p = 0.085', 'p - 0.98') significantly predicted progresson on Cable Lat Pulldown. This shows that total duration includes unrelated muscle groups and rest rather than volume specific to the lift in focus.
+
+# Link to Notebook:
+https://chawbolt.github.io/workout-strength-analysis/
