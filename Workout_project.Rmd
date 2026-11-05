@@ -1,0 +1,187 @@
+---
+title: "Analysing Strength Progression from Personal Arrow Workout Logs"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(jsonlite)
+library(lubridate)
+
+
+```
+
+```{r}
+# Import raw JSON file
+raw_json <- fromJSON("workout-data-export.json")
+
+# Extract the 'PersonalExcersise' part of file
+sets_raw <- as_tibble(raw_json$PersonalExercise)
+
+# Extract the session workout table
+workouts_raw_JSON <- as_tibble(raw_json$WorkoutInfo)
+
+# Look into the set log
+#glimpse(sets_raw)
+
+names(workouts_raw_JSON)
+
+# Seeing that the JSON session table contains all info which was in the CSV file, we can move forward only using the JSON file which means I will not need to bring the CSV and JSON together
+
+# I will now do the same cleaning as prior and set cols as numeric
+workouts_clean_JSON <- workouts_raw_JSON |>
+  filter(status == "Complete") |>
+  mutate(
+    date = as_datetime(date),
+    gym_time_min = as.numeric(time) / 60,
+    volume = as.numeric(volume),
+    sets = as.numeric(sets),
+    reps = as.numeric(reps)
+  ) |>
+  filter(gym_time_min >= 15 & gym_time_min <= 180) |>
+  filter(volume > 0 & sets > 0 & reps > 0) |>
+  select(workoutID, date, gym_time_min, volume, sets, reps)
+  
+length(intersect(workouts_clean_JSON$workoutID, sets_raw$workoutID))
+
+```
+
+After intersecting both the session data and set data, we can see that there is still a remaining 443 training sessions with matching ids. Now that both tables are loaded and link together, a metric to measure strength must be created and in this case it will be the estimated one rep max (e1RM). I will be using Epley's equation (e1RM = weight x (1 + reps/30). Here i will filder out high rep sets so endurance sets do not inflate any numbers.
+
+```{r}
+
+# Clean by changing date, weight, reps to date and numeric respectively. Follow by filtering outliers in weight and reps. Finally create a new column with e1RM.
+sets_clean <- sets_raw |>
+  mutate(
+    date = as_datetime(date),
+    weight = as.numeric(weight),
+    reps = as.numeric(reps)
+  ) |>
+  filter(weight > 0 & reps > 0  & reps <= 12) |>
+  mutate(e1RM = weight * (1+ reps/30))
+```
+
+Now that we have a metric for measuring strength, I will begin looking into a single, frequent lift before running over every excercise.
+
+```{r}
+sets_clean |>
+  count(exercise, sort = TRUE) |>
+  head(10)
+```
+
+Seeing that "Cable Lat Pulldown" is by far my most common exercise, I will begin with it. I would like to know what my peak strength for this lift was in any given workout.
+
+```{r}
+
+lift_sess_peak <- sets_clean |>
+  filter(exercise == "Cable Lat Pulldown") |>
+  group_by(workoutID) |>
+  summarize(
+    lift_peak_e1RM = max(e1RM),
+    lift_sets_done = n(),
+    .groups = "drop"
+  )
+
+
+```
+
+Using inner_join we can exclude workouts where this lift is not preformed.
+
+```{r}
+trial_df <- workouts_clean_JSON |>
+  inner_join(lift_sess_peak, by = "workoutID") |>
+  arrange(date)
+
+nrow(trial_df)
+```
+
+Before I begin modelling, I would like to plot and see if there are any outliers and visualize any relationships.
+
+```{r}
+ggplot(trial_df, aes(x = date, y = lift_peak_e1RM)) + 
+  geom_point(alpha = 0.5, color = "cyan") + 
+  geom_smooth(method = "loess", color = "red", se = TRUE) + 
+  labs(
+    title = "Peak e1RM Progression Over Time",
+    x = "Date",
+    y = "e1RM (lbs)"
+  ) + 
+  theme_minimal()
+```
+
+Seeing this visually pegs the question, how does my average time spent in the gym affect my strength increase over time?
+
+Before I can begin modelling this, there are multiple challenges I must address when it comes to exercise. Strength from workout to workout can have varying shifts. For example, if I hit a hard leg day the day prior, my e1RM the next day on a lift may be lower. Also, if I attempt to use a date-based window to solve this, I do not always train consistently. Sometimes I may hit a muscle twice or three times in a week, and other times I could travel or get sick leaving weeks in between. To work around this, I will calculate my change in strength in about 4 weeks and my average training values in these windows.
+
+```{r}
+trial_windows <- trial_df |>
+  mutate(
+    win_start = date - days(35),
+    win_end = date - days(21)
+  )
+strength_delta <- trial_windows |>
+  left_join(
+    trial_df |>
+      select(past_date = date, past_e1RM = lift_peak_e1RM),
+    by = join_by(win_start <= past_date, win_end >= past_date)
+  ) |>
+  group_by(workoutID, date, lift_peak_e1RM, gym_time_min, volume) |>
+  summarize(
+    past_e1RM = mean(past_e1RM, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(delta_e1RM = lift_peak_e1RM - past_e1RM)
+
+strength_delta |>
+  filter(!is.na(delta_e1RM)) |>
+  select(date, lift_peak_e1RM, past_e1RM, delta_e1RM) |>
+  head(5)
+```
+
+Now that we can see how much my strength has changed over 4 weeks, I would like to know what it is I did in these weeks to cause this change.
+
+```{r}
+training_effort_28day <- strength_delta |>
+  filter(!is.na(delta_e1RM)) |>
+  mutate(train_block_start = date - days(28)) |>
+  left_join(
+    workouts_clean_JSON |>
+      select(train_date = date, train_gym_time =
+               gym_time_min, train_volume = volume),
+    by = join_by(train_block_start <= train_date,
+                 date >= train_date)
+  ) |>
+  group_by(workoutID, date, lift_peak_e1RM, past_e1RM,
+           delta_e1RM) |>
+  summarize(
+    avg_gym_time_28day = mean(train_gym_time,
+                              na.rm = TRUE),
+    workouts_28day = n(),
+    avg_volume_28day = mean(train_volume,na.rm = TRUE),
+    .groups = "drop"
+  )
+training_effort_28day |>
+select(date, delta_e1RM, avg_gym_time_28day, workouts_28day) |> head(10)
+```
+
+Now that this is prepared I would like to visualize and compare to see how my time spent in gym affects my strength.
+
+```{r}
+ggplot(training_effort_28day, aes(x = avg_gym_time_28day, y = delta_e1RM)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "green") + geom_point(alpha = 0.5, color = "blue") + 
+  geom_smooth(method = "lm", color = "red", se = TRUE) + labs(
+    title = "4 Week Change in Strength vs. Average Gym Time (Cable Lat Pulldown)",
+    x = "Avg Gym Time in Prior 28 Days (min)",
+    y = "4 Week change in e1RM (lbs)"
+  ) + theme_minimal()
+model_lat_pull <- lm(delta_e1RM ~ avg_gym_time_28day + workouts_28day + past_e1RM, data = training_effort_28day)
+summary(model_lat_pull)
+```
+
+Neither the plot nor linear regression show any significant positive relationship between average gym durration and strength gains in 4 weeks for cable lat pulldown (p = 0.085). Total time in gym includes all other workouts for other muscle groups and resting time. Long workouts doesn't mean more effective muscle stimulus.
+
+Along with time in gym, total gym sessions for the prior 28 days also had no significant effect (p = 0.98). Same as before, working out more doesn't automatically mean more targeted volume/recovery for this specific lift.
+
+The one predictor that showed significance is baseline strength 4 weeks prior (past_e1RM, Estimate = -0.196, p = 0.0002). For every 10lbs higher my prior e1RM was, I could expect to decrease by \~2lbs over the next 4 weeks. This shows how strength will naturally plateau as I approach my strength ceiling.
+
+The model explained about 10.9% of the variance in my 4 week strength change. The remaining variation likely comes from other fluctuations like sleep, nutrition, etc. Future analysis could improve by accounting for lift set volume and what order the exersize was performed each workout.
